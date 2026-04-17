@@ -99,8 +99,10 @@ def momentum_signal(df: pd.DataFrame) -> dict:
 
 def valuation_signal(code: str) -> dict:
     """
-    PE/PB 历史分位数估值信号
-    从 daily_snapshot 读取历史数据
+    PE/PB 均值回归估值信号
+    - 历史分位数：当前值在历史分布中的位置
+    - 均值回归折扣：当前值 vs 历史均值的偏离幅度
+    从 daily_snapshot 读取历史数据（每日积累，越久越准）
     """
     conn = sqlite3.connect(DB_PATH)
     df = pd.read_sql_query(
@@ -110,38 +112,73 @@ def valuation_signal(code: str) -> dict:
     conn.close()
 
     if df.empty or df["pe_ratio"].isna().all():
-        return {"signal": "neutral", "reason": "无估值数据", "pe_pctile": None, "pb_pctile": None}
+        return {"signal": "neutral", "reason": "无估值数据（需积累历史快照）", "pe_pctile": None, "pb_pctile": None}
 
     latest_pe = df["pe_ratio"].iloc[-1]
     latest_pb = df["pb_ratio"].iloc[-1]
 
-    # 历史分位（排除负值）
+    # 历史有效值（排除负值/零）
     pe_vals = df["pe_ratio"].dropna()
     pe_vals = pe_vals[pe_vals > 0]
     pb_vals = df["pb_ratio"].dropna()
     pb_vals = pb_vals[pb_vals > 0]
 
-    pe_pctile = (pe_vals < latest_pe).mean() * 100 if len(pe_vals) > 1 and latest_pe > 0 else None
-    pb_pctile = (pb_vals < latest_pb).mean() * 100 if len(pb_vals) > 1 and latest_pb > 0 else None
-
+    history_days = len(df)
     reasons = []
     overvalued = False
+    undervalued = False
 
-    if pe_pctile is not None:
-        reasons.append(f"PE {latest_pe:.1f}（历史{pe_pctile:.0f}%分位）")
+    # ── PE 分析 ──
+    pe_pctile = None
+    pe_vs_mean = None
+    if len(pe_vals) >= 5 and latest_pe > 0:
+        pe_mean = pe_vals.mean()
+        pe_pctile = (pe_vals < latest_pe).mean() * 100
+        pe_vs_mean = (latest_pe - pe_mean) / pe_mean  # 偏离均值百分比
+
         if pe_pctile > PE_HIGH_PCTILE:
             overvalued = True
-    if pb_pctile is not None:
-        reasons.append(f"PB {latest_pb:.2f}（历史{pb_pctile:.0f}%分位）")
+            reasons.append(f"PE {latest_pe:.1f}（均值{pe_mean:.1f}，+{pe_vs_mean:.0%}，历史{pe_pctile:.0f}%分位 ⚠️高估）")
+        elif pe_pctile < (100 - PE_HIGH_PCTILE):  # 低于20%分位
+            undervalued = True
+            reasons.append(f"PE {latest_pe:.1f}（均值{pe_mean:.1f}，{pe_vs_mean:.0%}，历史{pe_pctile:.0f}%分位 💡低估）")
+        else:
+            reasons.append(f"PE {latest_pe:.1f}（均值{pe_mean:.1f}，{pe_vs_mean:+.0%}，历史{pe_pctile:.0f}%分位）")
+    elif latest_pe > 0:
+        reasons.append(f"PE {latest_pe:.1f}（历史仅{history_days}天，分位待积累）")
+
+    # ── PB 分析 ──
+    pb_pctile = None
+    if len(pb_vals) >= 5 and latest_pb > 0:
+        pb_mean = pb_vals.mean()
+        pb_pctile = (pb_vals < latest_pb).mean() * 100
+        pb_vs_mean = (latest_pb - pb_mean) / pb_mean
+
         if pb_pctile > PB_HIGH_PCTILE:
             overvalued = True
+            reasons.append(f"PB {latest_pb:.2f}（均值{pb_mean:.2f}，+{pb_vs_mean:.0%}，{pb_pctile:.0f}%分位 ⚠️）")
+        elif pb_pctile < (100 - PB_HIGH_PCTILE):
+            undervalued = True
+            reasons.append(f"PB {latest_pb:.2f}（均值{pb_mean:.2f}，{pb_vs_mean:.0%}，{pb_pctile:.0f}%分位 💡）")
+        else:
+            reasons.append(f"PB {latest_pb:.2f}（均值{pb_mean:.2f}，{pb_vs_mean:+.0%}，{pb_pctile:.0f}%分位）")
+    elif latest_pb > 0:
+        reasons.append(f"PB {latest_pb:.2f}（历史{history_days}天，分位待积累）")
 
-    signal = "bearish" if overvalued else "neutral"
+    # 高估压制信号，低估加分
+    if overvalued:
+        signal = "bearish"
+    elif undervalued:
+        signal = "bullish"
+    else:
+        signal = "neutral"
+
     return {
         "signal": signal,
-        "reason": " | ".join(reasons) if reasons else "无数据",
+        "reason": " | ".join(reasons) if reasons else f"历史仅{history_days}天，数据积累中",
         "pe_pctile": pe_pctile,
         "pb_pctile": pb_pctile,
+        "history_days": history_days,
     }
 
 
@@ -166,6 +203,8 @@ def analyze_stock(code: str) -> dict:
         score -= 1
     if valuation["signal"] == "bearish":
         score -= 1  # 高估压制
+    elif valuation["signal"] == "bullish":
+        score += 1  # 低估加分（价值投资信号）
 
     return {
         "code": code,
