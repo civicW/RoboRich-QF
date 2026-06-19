@@ -1,0 +1,7 @@
+fred:
+  api_key: "YOUR_FRED_API_KEY"  # 从 https://fred.stlouisfed.org/docs/api/api_key.html 申请
+  base_url: "https://api.stlouisfed.org/fred"
+
+bea:
+  api_key: ""  # 待申请：https://apps.bea.gov/api/signup/
+  base_url: "https://apps.bea.gov/api/data"
